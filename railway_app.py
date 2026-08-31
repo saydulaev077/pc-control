@@ -1,8 +1,8 @@
-import os
-import time
-import threading
-import secrets
 import hmac
+import os
+import secrets
+import threading
+import time
 from collections import deque
 from functools import wraps
 
@@ -20,13 +20,14 @@ AGENT_SECRET = (os.getenv("AGENT_SECRET", "") or os.getenv("PC_AGENT_SECRET", ""
 
 app = Flask(__name__, static_folder="web")
 WEB_TOKEN = secrets.token_urlsafe(32)
+COMMAND_TTL = int(os.getenv("COMMAND_TTL", "120"))
 commands = deque(maxlen=100)
 lock = threading.Lock()
 state = {
-    "pc_online": False,
     "agent_online": False,
-    "last_seen": 0,
-    "pc_last_seen": 0,
+    "pc_online": False,
+    "last_seen": 0.0,
+    "pc_last_seen": 0.0,
     "last_result": None,
 }
 
@@ -34,10 +35,10 @@ state = {
 def web_auth(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        a = request.headers.get("Authorization", "")
-        if a.startswith("Bearer ") and hmac.compare_digest(a[7:], WEB_TOKEN):
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], WEB_TOKEN):
             return fn(*args, **kwargs)
-        return jsonify({"error": "Unauthorized"}), 401
+        return jsonify(error="Unauthorized"), 401
     return wrapper
 
 
@@ -45,32 +46,38 @@ def agent_auth(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         if not AGENT_SECRET:
-            return jsonify({"error": "AGENT_SECRET is not configured"}), 503
-        a = request.headers.get("X-Agent-Secret", "")
-        if hmac.compare_digest(a, AGENT_SECRET):
+            return jsonify(error="AGENT_SECRET is not configured"), 503
+        secret = request.headers.get("X-Agent-Secret", "")
+        if hmac.compare_digest(secret, AGENT_SECRET):
             return fn(*args, **kwargs)
-        return jsonify({"error": "Unauthorized"}), 401
+        return jsonify(error="Unauthorized"), 401
     return wrapper
+
+
+def authorized(update: Update):
+    return bool(update.effective_user and ALLOWED_USER_ID and update.effective_user.id == ALLOWED_USER_ID)
 
 
 def enqueue(action):
     item = {"id": secrets.token_hex(8), "action": action, "created": time.time()}
     with lock:
         commands.append(item)
-    print(f"[COMMAND] {action} -> {item['id']}")
+    print(f"[QUEUE] {action} #{item['id']}")
     return item
 
 
-def authorized(update):
-    return bool(update.effective_user and update.effective_user.id == ALLOWED_USER_ID)
+def cleanup_commands():
+    now = time.time()
+    with lock:
+        fresh = [x for x in commands if now - x.get("created", now) <= COMMAND_TTL]
+        commands.clear()
+        commands.extend(fresh)
 
 
 def bot_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Включить ПК", callback_data="wake"),
-         InlineKeyboardButton("🔴 Выключить ПК", callback_data="shutdown")],
-        [InlineKeyboardButton("🔄 Перезагрузить", callback_data="restart"),
-         InlineKeyboardButton("💤 Сон", callback_data="sleep")],
+        [InlineKeyboardButton("🟢 Включить", callback_data="wake"), InlineKeyboardButton("🔴 Выключить", callback_data="shutdown")],
+        [InlineKeyboardButton("🔄 Перезагрузить", callback_data="restart"), InlineKeyboardButton("💤 Сон", callback_data="sleep")],
         [InlineKeyboardButton("📊 Статус", callback_data="status")],
     ])
 
@@ -78,10 +85,7 @@ def bot_menu():
 async def bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update) or not update.message:
         return
-    await update.message.reply_text(
-        "🖥 PC CONTROL v5\n\nУправление Windows через Railway:",
-        reply_markup=bot_menu(),
-    )
+    await update.message.reply_text("🖥 PC CONTROL\n\nУправление Windows через Railway:", reply_markup=bot_menu())
 
 
 async def bot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,31 +102,37 @@ async def bot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with lock:
             s = dict(state)
         now = time.time()
-        agent = "🟢 онлайн" if s["last_seen"] and now - s["last_seen"] < 20 else "🔴 офлайн"
-        pc = "🟢 включён" if s["pc_online"] else "🔴 выключен"
+        agent = bool(s["last_seen"] and now - s["last_seen"] < 20)
+        pc = bool(s["pc_online"])
+        result = s.get("last_result")
+        result_text = "—"
+        if isinstance(result, dict):
+            result_text = str(result.get("message", result.get("action", "—")))[:120]
         await q.edit_message_text(
-            f"📊 СТАТУС\n\nWindows-агент: {agent}\nПК: {pc}",
+            "📊 СТАТУС\n\n"
+            f"Windows-агент: {'🟢 онлайн' if agent else '🔴 офлайн'}\n"
+            f"ПК: {'🟢 включён' if pc else '🔴 выключен'}\n"
+            f"Последний результат: {result_text}",
             reply_markup=bot_menu(),
         )
         return
 
     if action == "wake":
         await q.edit_message_text(
-            "⚠️ ПК полностью выключен.\n\n"
-            "Без Raspberry Pi/роутера/другого постоянно работающего устройства включить его из Railway невозможно.\n\n"
-            "Остальные команды работают, пока Windows-агент запущен.",
+            "🟡 Включение полностью выключенного ПК недоступно через один Railway.\n\n"
+            "Когда Windows выключен, на ПК нет программы, которая может получить команду. "
+            "Для Wake-on-LAN нужен роутер/другое постоянно работающее устройство.",
             reply_markup=bot_menu(),
         )
         return
 
     if action not in {"shutdown", "restart", "sleep"}:
         return
-
     item = enqueue(action)
     labels = {
-        "shutdown": "🔴 Команда выключения отправлена.",
-        "restart": "🔄 Команда перезагрузки отправлена.",
-        "sleep": "💤 Команда сна отправлена.",
+        "shutdown": "🔴 Команда выключения поставлена в очередь.",
+        "restart": "🔄 Команда перезагрузки поставлена в очередь.",
+        "sleep": "💤 Команда сна поставлена в очередь.",
     }
     await q.edit_message_text(
         f"{labels[action]}\nID: `{item['id']}",
@@ -136,15 +146,20 @@ def index():
     return send_from_directory(app.static_folder, "index.html")
 
 
+@app.get("/health")
+def health():
+    return jsonify(ok=True, service="pc-control")
+
+
 @app.post("/api/login")
 def login():
     data = request.get_json(silent=True) or {}
     password = str(data.get("password", ""))
     if not WEB_PASSWORD:
-        return jsonify({"ok": False, "error": "WEB_PASSWORD не настроен"}), 503
+        return jsonify(ok=False, error="WEB_PASSWORD не настроен в Railway"), 503
     if hmac.compare_digest(password, WEB_PASSWORD):
-        return jsonify({"ok": True, "token": WEB_TOKEN})
-    return jsonify({"ok": False, "error": "Неверный пароль"}), 401
+        return jsonify(ok=True, token=WEB_TOKEN)
+    return jsonify(ok=False, error="Неверный пароль"), 401
 
 
 @app.get("/api/state")
@@ -162,20 +177,21 @@ def api_power():
     data = request.get_json(silent=True) or {}
     action = str(data.get("action", "")).strip()
     if action == "wake":
-        return jsonify({"ok": False, "error": "Нельзя включить полностью выключенный ПК без постоянно работающего устройства в сети."}), 409
+        return jsonify(ok=False, error="Для полностью выключенного ПК нужен Wake-on-LAN через роутер или постоянно работающее устройство."), 409
     if action not in {"shutdown", "restart", "sleep"}:
-        return jsonify({"ok": False, "error": "Неизвестная команда"}), 400
+        return jsonify(ok=False, error="Неизвестная команда"), 400
     item = enqueue(action)
-    return jsonify({"ok": True, "command_id": item["id"]})
+    return jsonify(ok=True, command_id=item["id"])
 
 
 @app.get("/agent/poll")
 @agent_auth
 def agent_poll():
+    cleanup_commands()
     with lock:
         items = list(commands)
         commands.clear()
-    return jsonify({"commands": items})
+    return jsonify(commands=items)
 
 
 @app.post("/agent/heartbeat")
@@ -190,7 +206,7 @@ def agent_heartbeat():
         state["pc_online"] = pc_online
         if pc_online:
             state["pc_last_seen"] = now
-    return jsonify({"ok": True})
+    return jsonify(ok=True)
 
 
 @app.post("/agent/result")
@@ -199,12 +215,13 @@ def agent_result():
     data = request.get_json(silent=True) or {}
     with lock:
         state["last_result"] = data
-    print(f"[AGENT RESULT] {data}")
-    return jsonify({"ok": True})
+    print(f"[RESULT] {data}")
+    return jsonify(ok=True)
 
 
 def run_web():
     port = int(os.getenv("PORT", "8080"))
+    print(f"[WEB] Listening on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
 
 
