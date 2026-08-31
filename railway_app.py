@@ -134,11 +134,11 @@ async def bot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "restart": "🔄 Команда перезагрузки поставлена в очередь.",
         "sleep": "💤 Команда сна поставлена в очередь.",
     }
-    await q.edit_message_text(
-        f"{labels[action]}\nID: `{item['id']}",
-        parse_mode="Markdown",
-        reply_markup=bot_menu(),
-    )
+await q.edit_message_text(
+    f"{labels[action]}\n\n"
+    f"ID команды: {item['id']}",
+    reply_markup=bot_menu(),
+)
 
 
 @app.get("/")
