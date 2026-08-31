@@ -153,7 +153,22 @@ def run_bot():
     tg.add_handler(CallbackQueryHandler(bot_handler))
     tg.run_polling(drop_pending_updates=True)
 
-if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
+def run_web():
+    # Flask runs in a background thread. The Telegram polling loop must
+    # stay in the main interpreter thread because python-telegram-bot
+    # installs signal handlers when run_polling() starts.
     port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        threaded=True,
+        use_reloader=False,
+    )
+
+
+if __name__ == "__main__":
+    # IMPORTANT: do not start Telegram polling from a worker thread.
+    # Railway launches this file as the main process.
+    threading.Thread(target=run_web, daemon=True).start()
+    run_bot()
